@@ -1,0 +1,8 @@
+[package]
+name = "wavefunction-collapse-rs"
+version = "0.1.0"
+authors = ["Jack Stade <jack.stade@gmail.com>"]
+
+[dependencies]
+rand = "0.5.0"
+tensor_transforms = {path = "../tensor_transforms"}
