@@ -1,5 +1,7 @@
 use rand::prelude::random;
 use std::f64;
+use {CompatibleAlign, Transformable, Transform};
+use tensor_transforms::SymmetryObject;
 
 /// The basic struct for performing wfc.
 /// The wfc algorithm is essentially a method for solving a constrained graph.
@@ -43,47 +45,6 @@ pub struct ProtoGraph {
     // set of propogators
     propogators: Vec<Vec<Vec<usize>>>,
 }
-
-/// A type that can be compared to objects of another type.
-/// In almost all cases, the second type will be Self
-/// The direction of the alignment is based on a direction parameter, which
-/// which is a usize that iterates over all directions.
-/// To instead use the directions in each dimension, implement AlignPos<T>
-pub trait CompatibleAlign<T> {
-    /// Check the second object to see if it is compatible with this object when moved by `direction`.
-    /// `direction` is a usize that represents an axis and a sign
-    /// The axis is equal to `direction/2`,
-    /// and the sign is -1 if `direction` is even and 1 if `direction` is odd
-    fn align(&self, other: &T, direction: usize) -> bool;
-    
-    /// Returns the number of dimensions for this object. 
-    /// This is used to avoid calling `align` with a value of direction that is too large
-    fn dimensions(&self) -> usize;
-}
-
-/// See CompatibleAlign<T>
-pub trait AlignPos<T> {
-    /// See CompatibleAlign<T>. In this case, pos will 
-    /// explicitly state the amount to be moved in each direction.
-    fn align(&self, other: &T, pos: &[usize]) -> bool;
-
-    /// Returns the number of dimensions for this object.
-    fn dimensions(&self) -> usize;
-}
-
-impl<T> CompatibleAlign<T> for AlignPos<T> {
-    fn align(&self, other: &T, direction: usize) -> bool {
-        let mut offset = vec![0; self.dimensions()];
-        offset[direction / 2] = (direction % 2) * 2 - 1;
-        self.align(other, &offset[..])
-    }
-
-    fn dimensions(&self) -> usize {
-        self.dimensions()
-    }
-}
-
-use symmetry::{SymmetryObject, Transformable};
 
 impl ProtoGraph {
     /// Builds a new protograph, checking the provided information to make sure it is consistent.
@@ -142,7 +103,7 @@ impl ProtoGraph {
 
     /// This can more efficiently generate the propogation vector when using transforms. 
     /// It is currently unimplemented, but will reduce the number of calls to `align` by about 50%
-    pub fn from_symmetry_group<S: PartialEq, T: CompatibleAlign<T> + Transformable<T>>(
+    pub fn from_symmetry_group<S: PartialEq, T: CompatibleAlign<T> + Transformable>(
         _vals: &[T],
         _sym: &SymmetryObject<S>,
     ) -> Result<(ProtoGraph, Vec<T>), &'static str> {
