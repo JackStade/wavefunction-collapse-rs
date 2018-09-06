@@ -3,6 +3,11 @@ name = "wavefunction-collapse-rs"
 version = "0.1.0"
 authors = ["Jack Stade <jack.stade@gmail.com>"]
 
+[features]
+default = ["image"]
+
 [dependencies]
 rand = "0.5.0"
-tensor_transforms = {path = "../tensor_transforms"}
+tensor_transforms = {git = "https://github.com/JackStade/tensor_transforms_rs"}
+
+image = {version = "0.19.0", optional = true}

@@ -1,13 +1,28 @@
 use rand::prelude::random;
 use std::f64;
-use {CompatibleAlign, Transformable, Transform};
 use tensor_transforms::SymmetryObject;
+use {AlignArray, CompatibleAlign, Transform, Transformable};
 
 /// The basic struct for performing wfc.
+///
 /// The wfc algorithm is essentially a method for solving a constrained graph.
 /// Each node has a number of possible values, which are constrained by all adjacent nodes.
-/// The algorithm works by first setting a value with minium nonzero shannon entropy to a concrete value,
-/// and then propogating that information and repeating until all nodes have 0 entropy.
+/// The algorithm works by first setting a value with minium nonzero shannon entropy to one of
+/// its possible values, and then propogating that information and repeating until all nodes
+/// have 0 entropy (each node is set to a value).
+///
+/// The problem of satisfying these constraints is np-hard (and in fact np-complete),
+/// so this heuristic method can fail. Several things help to prevent this from happening:
+/// * The constraints are symmetric: i.e. each node has the same constraints
+/// * The set of constraints is relatively allowing
+///
+/// The first of these is enforced by this implementation, but it can be subverted
+/// by manually setting initial conditions. The second is good to keep in mind when
+/// setting constraints.
+///
+/// The algorithm is random, and so the only sets of constraints that will *never* work are
+/// ones that have no solutions, but some will work only extremely rarely. Interesting,
+/// there are some sets of constraints that will *always* work.
 pub struct Wave<'a> {
     // number of dimensions
     n: usize,
@@ -22,9 +37,6 @@ pub struct Wave<'a> {
     propogators: &'a Vec<Vec<Vec<usize>>>,
     // the wave values for this graph
     nodes: Vec<WaveItem<'a>>,
-    // the boolean values in each waveitem
-    // this is used for storage, and should not be read from or written to
-    item_values: Vec<Vec<bool>>,
     // the compatibility array
     // first index is the node
     // second index is the value
@@ -35,7 +47,7 @@ pub struct Wave<'a> {
 /// The prototype for a wave.
 /// Contains information about the compabitility of different values,
 /// as well as the dimension and number of values for each node.
-/// This is useful in cases where you only want to test the compatibility 
+/// This is useful in cases where you only want to test the compatibility
 /// (a relatively expensive operation) once
 pub struct ProtoGraph {
     // number of dimensions
@@ -43,44 +55,51 @@ pub struct ProtoGraph {
     // number of vals
     bits: usize,
     // set of propogators
+    // first index is the value,
+    // second index is the direction
     propogators: Vec<Vec<Vec<usize>>>,
 }
 
 impl ProtoGraph {
     /// Builds a new protograph, checking the provided information to make sure it is consistent.
+    ///
     /// This method takes a value `n`, which is the number of dimensions, a value 'bits' which is the number of values,
     /// and a multidimensional `Vec` representing the compatibilities between different values.
-    /// Note that this does NOT check that the propogators are symmetrical, if they are not symmetrical then 
+    /// Note that this does NOT check that the propogators are symmetrical, if they are not symmetrical then
     /// trying to collapse a wave built with assymetric propogators will very likely fail or cause strange behavior.
-    /// This function should almost never be used, instead use `from_align`
-    pub fn new(
-        n: usize,
-        bits: usize,
-        propogators: Vec<Vec<Vec<usize>>>,
-    ) -> Result<ProtoGraph, &'static str> {
+    ///
+    /// This function is intended to allow external crates to add ways to generate a protograph. The values given to
+    /// it should not be generated manually.
+    ///
+    /// # Panics
+    /// This function panics if the provided values as inconsistent. Specifically, the value of `bits` must
+    /// be equal to `propogators.len()` and `propogators[i].len()` must be equal to `2 * n` for all `i`.
+    pub fn new(n: usize, bits: usize, propogators: Vec<Vec<Vec<usize>>>) -> ProtoGraph {
         if Vec::len(&propogators) != bits {
-            return Err("Outermost vec size must be equal to the number of values");
+            panic!("Outermost vec size must be equal to the number of values.");
         }
         for vec in propogators.iter() {
             if Vec::len(vec) != 2 * n {
-                return Err("Inner vecs must have size equal to the number of directions, which is twice the number of dimensions");
+                panic!("Inner vecs must have size equal to the number of directions, which is twice the number of dimensions.");
             }
         }
-        Ok(ProtoGraph {
+        ProtoGraph {
             n: n,
             bits: bits,
             propogators: propogators,
-        })
+        }
     }
 
-    /// Creates a protograph by comparing the values in `vals`. 
-    /// This checks to make sure all vals have the same dimension.
-    pub fn from_align<T: CompatibleAlign<T>>(vals: &[T]) -> Result<ProtoGraph, &'static str> {
+    /// Creates a protograph by comparing the values in `vals`.
+    ///
+    /// # Panics
+    /// Panics if the values do not all have the same dimension.
+    pub fn from_align<T: CompatibleAlign<T>>(vals: &[T]) -> ProtoGraph {
         let mut vec = Vec::with_capacity(vals.len());
         let dim = vals[0].dimensions();
         for i in 0..vals.len() {
             if vals[i].dimensions() != dim {
-                return Err("Cannot compare differently dimensioned data.");
+                panic!("Cannot compare differently dimensioned data.");
             }
             let mut directions = Vec::with_capacity(2 * dim);
             for dir in 0..(2 * dim) {
@@ -94,52 +113,184 @@ impl ProtoGraph {
             }
             vec.push(directions);
         }
-        Ok(ProtoGraph {
+        ProtoGraph {
             n: dim,
             bits: vals.len(),
             propogators: vec,
-        })
+        }
     }
 
-    /// This can more efficiently generate the propogation vector when using transforms. 
-    /// It is currently unimplemented, but will reduce the number of calls to `align` by about 50%
-    pub fn from_symmetry_group<S: PartialEq, T: CompatibleAlign<T> + Transformable>(
-        _vals: &[T],
-        _sym: &SymmetryObject<S>,
-    ) -> Result<(ProtoGraph, Vec<T>), &'static str> {
-        Err("Efficient ProtoGraph generation from symmetry groups is not implemented yet.")
+    /// Generates a ProtoGraph from an AlignArray.
+    pub fn from_align_array<T: AlignArray>(
+        array: T,
+        threshold: f64,
+        block_size: &[usize],
+        overlap: &[usize],
+    ) -> ProtoGraph {
+        // here we generally assume that array.get_size() is not
+        // more expensive than looking up a value from an array.
+        // for this reason, the results are not cached because that would
+        // require allocating extra space
+        let mut len = array.get_size(0) - block_size[0] + 1;
+        let mut dim = 1;
+        loop {
+            let x = array.get_size(dim) - block_size[dim] + 1;
+            if (x != 0) {
+                len *= x;
+                dim += 1;
+            } else {
+                break;
+            }
+        }
+        let mut vec = Vec::with_capacity(len);
+        let mut pos = vec![0; dim];
+        for i in 0..len {
+            let mut d = 0;
+            loop {
+                pos[d] += 1;
+                if pos[d] > array.get_size(d) - block_size[d] + 1 {
+                    pos[d] = 0;
+                    d += 1;
+                } else {
+                    break;
+                }
+            }
+            let mut directions = Vec::with_capacity(2 * dim);
+            for dir_axis in 0..dim {
+                // the total threshold in this direction
+                let mut total_threshold = threshold;
+                for d in 0..dim {
+                    if d == dir_axis {
+                        total_threshold *= overlap[d] as f64;
+                    } else {
+                        total_threshold *= block_size[d] as f64;
+                    }
+                }
+                let mut values = Vec::new();
+                for dir in 0..2 {
+                    let mut pos_2 = vec![0; dim];
+                    for k in 0..len {
+                        let mut d = 0;
+                        loop {
+                            pos_2[d] += 1;
+                            if pos_2[d] > array.get_size(d) - block_size[d] + 1 {
+                                pos_2[d] = 0;
+                                d += 1;
+                            } else {
+                                break;
+                            }
+                        }
+                        let mut pos_1_item;
+                        let mut pos_2_item;
+                        // pos_1 and pos_2 are swapped based on the sign
+                        // of the direction, so from here on the sign doesn't matter
+                        if dir == 0 {
+                            // the loop that iterates through the values of the positions
+                            // will reset these values when finished, so we don't need to clone
+                            pos_1_item = &mut pos;
+                            pos_2_item = &mut pos_2;
+                        } else {
+                            pos_1_item = &mut pos_2;
+                            pos_2_item = &mut pos;
+                        }
+                        let align_offset = block_size[dir_axis] - overlap[dir_axis];
+                        // we offset the value in pos_1 by the offset
+                        pos_1_item[dir_axis] += align_offset;
+                        let mut box_dim = 0;
+                        let mut box_offset = vec![0; dim];
+                        let mut box_total = 0.0;
+                        loop {
+                            let mut d = 0;
+                            loop {
+                                if d == dim {
+                                    break;
+                                };
+                                box_offset[d] += 1;
+                                // this needs to adjust the values in pos_1_item and
+                                // pos_2_item
+                                pos_1_item[d] += 1;
+                                pos_2_item[d] += 1;
+                                // the bounds on the checking direction are different from
+                                // the values in the overlap array
+                                let mut dimension_max = if d == dir_axis {
+                                    overlap[d]
+                                } else {
+                                    block_size[d]
+                                };
+                                if box_offset[d] == dimension_max {
+                                    box_offset[d] = 0;
+                                    // we want to reset the other items to their previous value,
+                                    // which is usually not 0
+                                    pos_1_item[d] -= dimension_max;
+                                    pos_2_item[d] -= dimension_max;
+                                    d += 1;
+                                } else {
+                                    break;
+                                }
+                            }
+                            // when d is maxed, the loop is over
+                            if d == dim {
+                                break;
+                            };
+                            // check the two values. If they do not line up, then
+                            // the values cannot be said to be comparable
+                            box_total += array.compare_values(pos_1_item, pos_2_item);
+                            if box_total > total_threshold {
+                                break;
+                            }
+                        }
+                        if box_total <= total_threshold {
+                            values.push(k);
+                        }
+                    }
+                }
+                directions.push(values);
+            }
+            vec.push(directions);
+        }
+        ProtoGraph {
+            n: dim,
+            bits: len,
+            propogators: vec,
+        }
     }
 }
 
 use std::slice;
 
 impl<'a> Wave<'a> {
+    /// Creates a new wave. The provided protograph is used to determine the
+    /// the constraints on each node. The created graph will start with each value
+    /// being possible.
+    ///
+    /// # Panics
+    /// This function will panic if the length of `distrib`, `size`, or `wrap` is smaller
+    /// than the length of the ProtoGraph. These lengths can be larger than that length, in
+    /// which case extra elements will be ignored.
     pub fn new<'b>(
         proto: &'b ProtoGraph,
         distrib: &'b [f64],
         size: &[usize],
         wrap: &[bool],
     ) -> Wave<'b> {
+        let len = proto.bits;
+        if distrib.len() < len {
+            panic!("The provided distribution does not contain enough elements.");
+        }
+        if size.len() < len {
+            panic!("The provided set of sizes does not contain enough elements.");
+        }
+        if wrap.len() < len {
+            panic!("The provided set of wrapping values does not contain enough elements.");
+        }
         let mut product = 1;
         for &s in size.iter() {
             product *= s;
         }
         let mut vals = Vec::with_capacity(product);
-        let mut item_vals = Vec::with_capacity(product);
-        for i in 0..product {
-            item_vals.push(vec![true; proto.bits]);
-            // each element in vals contains a reference to one of the arrays in item_vals
-            // normally, rust would not let us do this,
-            // because it could allow multiple mutable references to the same element in the array
-            // here, unsafe code is used because it is known that each element will only be used once
-            // since item_vals does not remember these references, this violates mutability rules
-            // because item_values can still be mutated
-            // methods in this module need to be careful of this when using those values
-            let slice = unsafe {
-                let pointer = item_vals[i].as_mut_ptr();
-                slice::from_raw_parts_mut(pointer, item_vals[i].len())
-            };
-            vals.push(WaveItem::new(slice, distrib));
+
+        for _ in 0..product {
+            vals.push(WaveItem::new(vec![true; len], distrib));
         }
         Wave {
             n: proto.n,
@@ -147,7 +298,6 @@ impl<'a> Wave<'a> {
             wrap: wrap.to_vec(),
             propogators: &proto.propogators,
             nodes: vals,
-            item_values: item_vals,
             comp: Self::gen_compat(product, &proto),
         }
     }
@@ -168,18 +318,9 @@ impl<'a> Wave<'a> {
         }
         full_array
     }
-    
-    fn get_pos(&'a mut self, pos: &[usize]) -> &'a mut WaveItem<'a> {
-        let mut align_pos = 0;
-        let mut prod = 1;
-        for (coord, size) in pos.iter().zip(self.size.iter()) {
-            align_pos += coord * prod;
-            prod *= size;
-        }
-        &mut self.nodes[align_pos]
-    }
-    
+
     /// Gets the first value for each node that is possible.
+    ///
     /// Returns `usize::max_value()` for nodes that are impossible.
     pub fn get_data(&self) -> Vec<usize> {
         let size = self.nodes.len();
@@ -195,8 +336,8 @@ impl<'a> Wave<'a> {
         vals
     }
 
-    /// Uses the provided function to expand the values into a potentially more useable format
-    pub fn get_expanded_data<T>(&self, operator: fn(usize) -> T) -> Vec<T> {
+    /// Uses the provided function to expand the values into a potentially more useable format.
+    pub fn get_expanded_data<T, U: Fn(usize) -> T>(&self, operator: U) -> Vec<T> {
         let size = self.nodes.len();
         let mut vals = Vec::with_capacity(size);
         for i in 0..size {
@@ -215,36 +356,31 @@ impl<'a> Wave<'a> {
         vals
     }
 
-    /// Expands the data, allowing each element in the wave to become a subsection of the result.
-    /// This is useful for tilesets, where each tile represents several pixels in the output.
-    pub fn get_box_expanded_data<T: Default>(
-        &self,
-        size: &[usize],
-        operator: fn(usize, &[usize]) -> T,
-    ) -> Vec<T> {
-        let mut product = 1;
-        for &s in size {
-            product *= s;
+    /// Marks all values in the provided stack as impossible and propogates this
+    /// information.
+    ///
+    /// The provided vec will be empty after this returns, but additional elements
+    /// will be pushed to it during propogation, potentially increasing its capacity.
+    pub fn disable_values(&mut self, stack: &mut Vec<(usize, usize)>) {
+        // first mark the values in the stack as false
+        for &(node, value) in stack.iter() {
+            self.nodes[node].set(value);
         }
-        let size = self.nodes.len() * product;
-        let vals = Vec::with_capacity(size);
-        let data = self.get_data();
-        let mut i = 0;
-        let mut pos = 0;
-        let mut result_index = 0;
-        let mut box_pos = vec![0; self.n];
-        vals
+        while let Some(pos) = stack.pop() {
+            self.propogate(pos, stack);
+        }
     }
 
-    /// Runs the wavefunction collapse algorithm on this wave. 
+    /// Runs the wavefunction collapse algorithm on this wave.
     pub fn collapse(&mut self) {
         let mut stack = Vec::with_capacity(self.nodes.len() * self.nodes[0].vals.len());
         self.check(&mut stack);
-        let mut ind = 3;
+        // note: do-while loop
         while {
             while let Some(pos) = stack.pop() {
                 self.propogate(pos, &mut stack);
             }
+            // set returns false when there are no non-zero elements
             self.set(&mut stack)
         } {}
     }
@@ -340,12 +476,11 @@ impl<'a> Wave<'a> {
 // this struct is used to keep track of the entropy of each wave node
 struct WaveItem<'a> {
     // the raw values for this node
-    // the length of this slice is used to determine the number of values
-    vals: &'a mut [bool],
+    vals: Vec<bool>,
 
     // the distribution of values
     // this is often the same for several or all nodes, so this is a reference
-    // while these are floating point values, they do not need to add to one
+    // the distribution does not need to have a total of one, it will be normalized
     distrib: &'a [f64],
 
     // these next values are used to help calculate entropy
@@ -364,7 +499,7 @@ struct WaveItem<'a> {
 
 impl<'a> WaveItem<'a> {
     // create a new node
-    fn new<'b>(vals: &'b mut [bool], distrib: &'b [f64]) -> WaveItem<'b> {
+    fn new<'b>(mut vals: Vec<bool>, distrib: &'b [f64]) -> WaveItem<'b> {
         if vals.len() > distrib.len() {
             panic!("Not enough elements in distrib!");
         }
@@ -377,7 +512,7 @@ impl<'a> WaveItem<'a> {
             if distrib[i] <= 0.0 {
                 vals[i] = false;
             }
-            // false values should be ignored
+            // the values passed can contain data that is not marked as possible
             if vals[i] {
                 num += 1;
                 total += distrib[i];
@@ -396,18 +531,6 @@ impl<'a> WaveItem<'a> {
             mult: mult,
             entropy: entropy,
             num: num,
-        }
-    }
-
-    // copies and existing node, using the provided slice to store the vals
-    fn copy(&self, vals: &'a mut [bool]) -> WaveItem<'a> {
-        vals.copy_from_slice(self.vals);
-        WaveItem {
-            vals: vals,
-            distrib: self.distrib,
-            mult: self.mult,
-            entropy: self.entropy,
-            num: self.num,
         }
     }
 
@@ -539,7 +662,7 @@ impl<'a> Iterator for WaveIterator<'a> {
                     false => return self.next(),
                 }
             }
-            
+
             Some((
                 new_pos as usize,
                 // we incremented the index earlier, so we need to subtract one here

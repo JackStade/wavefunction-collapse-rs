@@ -1,39 +1,72 @@
+#[cfg(feature = "image")]
+extern crate image;
+
 extern crate rand;
 extern crate tensor_transforms;
 
+#[cfg(feature = "image")]
+pub mod image_impls;
 pub mod wfc_algorithm;
-use std::cmp::{max, PartialEq};
+
+use std::cmp::PartialEq;
 use std::marker::Sized;
+pub use wfc_algorithm::{ProtoGraph, Wave};
 
-use tensor_transforms::{Transform, Transformable, TransformDimension};
 use tensor_transforms::transformable_objects::{DirectionObject, TransformTensor};
+use tensor_transforms::{Transform, TransformDimension, Transformable};
 
-/// A type that can be compared to objects of another type.
-/// In almost all cases, the second type will be Self
+/// A type that can be compared to objects of another type (usually itself).
+///
 /// The direction of the alignment is based on a direction parameter, which
-/// which is a usize that iterates over all directions.
+/// which is a `usize` that iterates over all directions.
 /// To instead use the directions in each dimension, implement AlignPos<T>
 pub trait CompatibleAlign<T>: TransformDimension {
     /// Check the second object to see if it is compatible with this object when moved by `direction`.
     /// `direction` is a usize that represents an axis and a sign
     /// The axis is equal to `direction/2`,
-    /// and the sign is -1 if `direction` is even and 1 if `direction` is odd
+    /// and the sign is -1 if `direction` is even and 1 if `direction` is odd.
     fn align(&self, other: &T, direction: usize) -> bool;
 }
 
-/// See CompatibleAlign<T>
+/// The sole purpose of this trait is to make implementing CompatibleAlign
+/// easier. CompatibleAlign uses a convention for numeric directions that is
+/// widely used internally within this library, but can be confusing.
 pub trait AlignPos<T>: TransformDimension {
-    /// See CompatibleAlign<T>. In this case, pos will 
+    /// See CompatibleAlign<T>. In this case, pos will
     /// explicitly state the amount to be moved in each direction.
-    fn align(&self, other: &T, pos: &[usize]) -> bool;
+    /// This can be wasteful since it requires allocating a vec, though
+    /// the compiler can often optimize it. This function should not be expected
+    /// to return a meaningful value when pos contains anything other than an array
+    /// of 0s with one 1 or -1.
+    fn align(&self, other: &T, pos: &[isize]) -> bool;
 }
 
-impl<T> CompatibleAlign<T> for AlignPos<T> {
+impl<T, U: AlignPos<T>> CompatibleAlign<T> for U {
     fn align(&self, other: &T, direction: usize) -> bool {
         let mut offset = vec![0; self.dimensions()];
-        offset[direction / 2] = (direction % 2) * 2 - 1;
+        offset[direction / 2] = ((direction % 2) * 2) as isize - 1;
         self.align(other, &offset[..])
     }
+}
+
+/// This trait can be used to compare rectangular (or hyper rectangular) slices of an n-dimensional array.
+///
+/// The function `compare_values` takes two multidimensional array indices and outputs an f64
+/// that represents the difference between them, and the function `get_size` takes a dimension and
+/// outputs the size of the array in that dimension. This second function should return 0 for the first
+/// dimension that is not a dimension in the array. For example, a 2 dimensional array with size (15, 20)
+/// should return 15, 20, and then 0. The second function should generally assumed to be relatively cheap.
+pub trait AlignArray {
+    /// Gets the size of the array in a certain dimension. This is generally expected to
+    /// be a cheap operation.
+    fn get_size(&self, dim: usize) -> usize;
+
+    /// Compares two values in the array and returns some difference value. This difference value
+    /// will be compared to a threshold to see if the comparison of larger chunks succeeds. There
+    /// are two main ways to implment this. Either this function checks for equality and returns 0
+    /// in cases where the values are equal and 1 when they are not, or it returns the square difference
+    /// between two values.
+    fn compare_values(&self, &[usize], &[usize]) -> f64;
 }
 
 impl<T: PartialEq + Sized> CompatibleAlign<TransformTensor<T>> for TransformTensor<T> {
